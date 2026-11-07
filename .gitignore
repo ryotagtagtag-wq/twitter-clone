@@ -28,6 +28,18 @@ yarn-error.log*
 # local env files
 .env*.local
 
+# 環境変数（実値を含むためコミットしない）
+.env*
+!.env.example
+
+# Firebase のローカル出力
+.firebase/
+firebase-debug.log*
+firestore-debug.log
+ui-debug.log
+functions/.env
+functions/lib/
+
 # vercel
 .vercel
 
