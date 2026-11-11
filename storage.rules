@@ -1,23 +1,53 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    function isAdmin() {
-      return request.auth.uid == 'Twt0A27bx9YcG4vu3RTsR7ifJzf2';
-    }
-    
+
+    // 管理者判定: カスタムクレーム推奨 (ハードコード削除)
+    // function isAdmin() {
+    //   return request.auth.token.admin == true;
+    // }
+
     function isAuthorized(userId) {
-      return request.auth != null && (userId == request.auth.uid || isAdmin());
-    }
-  
-    function isValidMedia() {
-      return request.resource.contentType.matches('image/.*|video/.*')
-             && request.resource.size < 50 * 1024 * 1024;
+      return request.auth != null && request.auth.uid == userId;
     }
 
+    function isValidMedia() {
+      return request.resource.contentType.matches('image/.*|video/.*')
+             && request.resource.size < 50 * 1024 * 1024; // 50 MB
+    }
+
+    // ==================== 既存: ツイート用画像 ====================
+    // パス: images/{userId}/{fileName}
+    // - 読み取り: 認証済みなら誰でも (公開ツイート前提)
+    // - 作成: 本人のみ + バリデーション
+    // - 更新/削除: 不許可 (Functions の normalize-stats でのみ削除)
     match /images/{userId}/{fileName} {
       allow read: if request.auth != null;
       allow create: if isAuthorized(userId) && isValidMedia();
       allow update, delete: if false;
     }
+
+    // ==================== 新規: DM 用画像 ====================
+    // パス: dm-images/{conversationId}/{fileName}
+    // - 会話参加者のみ読み取り可 (Firestore 参照で検証)
+    // - 作成: 参加者のみ + バリデーション
+    // - 更新/削除: 不許可
+    //
+    // ⚠️ 注意: firestore.get() で会話ドキュメントを参照する。
+    // Spark プラン (無料) で Firestore 参照が動作するかは **未確認**。
+    // エミュレータでは動作するが、本番での読み取り上限 (5 万/日) や
+    // Storage ルールからの Firestore アクセス可否は要検証。
+    match /dm-images/{conversationId}/{fileName} {
+      // 会話ドキュメント取得 (存在チェック + 参加者検証)
+      function isConversationParticipant() {
+        let conversation = firestore.get(/databases/(default)/documents/conversations/$(conversationId));
+        return conversation.exists && request.auth.uid in conversation.data.participants;
+      }
+
+      allow read: if request.auth != null && isConversationParticipant();
+      allow create: if request.auth != null && isConversationParticipant() && isValidMedia();
+      allow update, delete: if false;
+    }
+
   }
 }

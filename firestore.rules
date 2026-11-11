@@ -1,14 +1,32 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    function isAdmin() {
-      return request.auth.uid == 'Twt0A27bx9YcG4vu3RTsR7ifJzf2';
+
+    // ==================== ヘルパー関数 ====================
+
+    // 管理者判定: カスタムクレーム admin == true を推奨 (ハードコード UID は削除)
+    // TODO: Firebase Auth カスタムクレーム設定後に有効化
+    // function isAdmin() {
+    //   return request.auth.token.admin == true;
+    // }
+    // 暫定: 管理者機能をルールで制御しない (API ルート側で Admin SDK 使用)
+
+    // 所有者判定
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
     }
 
-    function isAuthorized(userId) {
-      return request.auth != null && (userId == request.auth.uid || isAdmin());
+    // 会話参加者判定
+    function isParticipant(participants) {
+      return request.auth != null && request.auth.uid in participants;
     }
 
+    // 通知受信者判定
+    function isRecipient(recipientId) {
+      return request.auth != null && request.auth.uid == recipientId;
+    }
+
+    // バリデーション関数
     function isValidText(text) {
       return text is string || text == null;
     }
@@ -16,17 +34,145 @@ service cloud.firestore {
     function isValidImages(images) {
       return (images is list && images.size() <= 4) || images == null;
     }
-    
-    match /tweets/{tweetId} {
-      allow read, update: if request.auth != null;
-      allow create: if isAuthorized(request.resource.data.createdBy)
-                       && isValidText(request.resource.data.text)
-                       && isValidImages(request.resource.data.images);
-      allow delete: if isAuthorized(resource.data.createdBy);
+
+    function isValidHashtags(hashtags) {
+      return hashtags is list && hashtags.size() <= 10;
     }
 
-    match /users/{document=**} {
-      allow read, write: if request.auth != null;
+    function isValidSearchText(searchText) {
+      return searchText is string && searchText.size() <= 1000;
     }
+
+    function isValidMessageText(text) {
+      return text is string && text.size() > 0 && text.size() <= 2000;
+    }
+
+    function isValidNotificationType(type) {
+      return type in ['like', 'repost', 'reply', 'quote', 'follow'];
+    }
+
+    // 更新時の変更フィールドチェック (tweets 用)
+    // 許可リスト: userLikes, userRetweets, userReplies, hashtags, searchText, updatedAt
+    // 本人以外は配列操作 (UID 追加/削除) のみ許可
+    function isAllowedTweetUpdate() {
+      let affected = request.resource.data.diff(resource.data).affectedKeys();
+      let allowedKeys = ['userLikes', 'userRetweets', 'userReplies', 'hashtags', 'searchText', 'updatedAt'];
+      let isSubset = affected.hasOnly(allowedKeys);
+      let isOwnerUpdate = isOwner(resource.data.createdBy);
+
+      // 本人以外の場合: 配列フィールドへの要素追加/削除のみ許可 (arrayUnion/arrayRemove 相当)
+      // 注意: Firestore ルールでは arrayUnion/arrayRemove の検知は困難なため、
+      // ここでは「許可キーのみ変更かつ本人以外なら配列フィールドのみ」という緩いチェックに留める。
+      // 厳密な検証はアプリ側 (utils.ts) のバッチ書き込みで担保する。
+      return isSubset && (isOwnerUpdate || affected.hasOnly(['userLikes', 'userRetweets', 'userReplies', 'updatedAt']));
+    }
+
+    // ==================== tweets コレクション ====================
+    match /tweets/{tweetId} {
+      // 公開読み取り: 認証済みなら誰でも
+      allow read: if request.auth != null;
+
+      // 作成: 本人のみ + バリデーション
+      allow create: if isOwner(request.resource.data.createdBy)
+                       && isValidText(request.resource.data.text)
+                       && isValidImages(request.resource.data.images)
+                       && isValidHashtags(request.resource.data.hashtags)
+                       && isValidSearchText(request.resource.data.searchText)
+                       && request.resource.data.quotedPostId == null
+                          || request.resource.data.quotedPostId is string;
+
+      // 更新: フィールド単位制限 (本人以外は userLikes/userRetweets/userReplies のみ)
+      allow update: if isAllowedTweetUpdate();
+
+      // 削除: 作成者のみ
+      allow delete: if isOwner(resource.data.createdBy);
+    }
+
+    // ==================== users コレクション (ドキュメント直下) ====================
+    match /users/{uid} {
+      // 自分の文書: 全読み書き可
+      allow read, write: if isOwner(uid);
+
+      // 他人の文書: 読み取りのみ + followers 配列への自身 UID 追加/削除のみ書き込み可
+      allow read: if request.auth != null;
+      allow update: if !isOwner(uid)
+                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['followers', 'updatedAt'])
+                       && request.auth.uid in request.resource.data.followers
+                       && !(request.auth.uid in resource.data.followers); // 追加のみ (削除は別条件)
+
+      // アンフォロー (followers から自身を削除) も許可
+      allow update: if !isOwner(uid)
+                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['followers', 'updatedAt'])
+                       && !(request.auth.uid in request.resource.data.followers)
+                       && request.auth.uid in resource.data.followers; // 削除のみ
+
+      // following 配列は他人から書き込み不可 (自分の文書のみ更新)
+      // 削除: 不許可 (ユーザー削除は Auth 側で行う)
+      allow delete: if false;
+    }
+
+    // ==================== users/{uid}/bookmarks サブコレクション ====================
+    match /users/{uid}/bookmarks/{bookmarkId} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // ==================== users/{uid}/stats サブコレクション ====================
+    match /users/{uid}/stats/{statsId} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // ==================== conversations コレクション ====================
+    match /conversations/{conversationId} {
+      // 参加者のみ読み取り可
+      allow read: if isParticipant(resource.data.participants);
+
+      // 作成: 参加者に自分を含む + 長さ2
+      allow create: if isParticipant(request.resource.data.participants)
+                       && request.resource.data.participants.size() == 2
+                       && request.resource.data.lastMessage is string
+                       && request.resource.data.lastMessage.size() > 0
+                       && request.resource.data.lastMessageAt is timestamp
+                       && request.resource.data.unread is map
+                       && request.resource.data.createdAt is timestamp
+                       && request.resource.data.updatedAt is timestamp;
+
+      // 更新: 参加者のみ + 許可フィールドのみ (lastMessage, lastMessageAt, unread, updatedAt)
+      allow update: if isParticipant(resource.data.participants)
+                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                         'lastMessage', 'lastMessageAt', 'unread', 'updatedAt'
+                       ]);
+
+      // 削除: 不許可 (会話履歴は残す)
+      allow delete: if false;
+
+      // ==================== messages サブコレクション ====================
+      match /messages/{messageId} {
+        // 親会話の参加者のみ読み取り可
+        allow read: if isParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants);
+
+        // 作成: 送信者が自分 + 親会話の参加者 + バリデーション
+        allow create: if isParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+                         && request.resource.data.senderId == request.auth.uid
+                         && isValidMessageText(request.resource.data.text)
+                         && (request.resource.data.imageUrl == null || request.resource.data.imageUrl is string)
+                         && request.resource.data.createdAt is timestamp
+                         && request.resource.data.readBy is list
+                         && request.auth.uid in request.resource.data.readBy;
+
+        // 更新/削除: MVP では不許可 (将来拡張時は senderId == request.auth.uid で許可検討)
+        allow update, delete: if false;
+      }
+    }
+
+    // ==================== notifications コレクション ====================
+    match /notifications/{notificationId} {
+      // 受信者本人のみ読み取り可
+      allow read: if isRecipient(resource.data.recipientId);
+
+      // クライアントからの作成・更新・削除: 全面禁止
+      // 作成・既読更新・削除は Vercel API ルート (Admin SDK) のみが実行
+      allow create, update, delete: if false;
+    }
+
   }
 }
